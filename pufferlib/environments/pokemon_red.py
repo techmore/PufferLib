@@ -69,6 +69,8 @@ class PokemonRed(Env):
             video_interval_mul=256,
             downsample_factor=2,
             frame_stacks=3,
+            self.explore_weight = 1 if 'explore_weight' not in config else config['explore_weight']
+            self.use_screen_explore = True if 'use_screen_explore' not in config else config['use_screen_explore']
             similar_frame_dist=2000000.0,
             reset_count=0,
             instance_id=None,
@@ -113,9 +115,14 @@ class PokemonRed(Env):
             WindowEvent.PRESS_ARROW_UP,
             WindowEvent.PRESS_BUTTON_A,
             WindowEvent.PRESS_BUTTON_B,
-            WindowEvent.PRESS_BUTTON_START,
-            WindowEvent.PASS
         ]
+
+        if self.extra_buttons:
+            self.valid_actions.extend([
+                WindowEvent.PRESS_BUTTON_START,
+                WindowEvent.PASS
+            ])
+
 
         self.release_arrow = [
             WindowEvent.RELEASE_ARROW_DOWN,
@@ -154,7 +161,8 @@ class PokemonRed(Env):
         )
 
         self.screen = self.pyboy.botsupport_manager().screen()
-        self.pyboy.set_emulation_speed(0 if headless else 6)
+        if not config['headless']:
+            self.pyboy.set_emulation_speed(6)
         self.reset()
 
     def reset(self, seed=None):
@@ -164,8 +172,11 @@ class PokemonRed(Env):
         with open(self.init_state, "rb") as f:
             self.pyboy.load_state(f)
 
-        self.init_knn()
-
+        if self.use_screen_explore:
+            self.init_knn()
+        else:
+            self.init_map_mem()
+            
         self.recent_memory = np.zeros(
             (self.output_shape[1]*self.memory_height, 3),
             dtype=np.uint8,
@@ -213,6 +224,9 @@ class PokemonRed(Env):
         self.knn_index.init_index(
             max_elements=self.num_elements, ef_construction=100, M=16)
 
+    def init_map_mem(self):
+        self.seen_coords = {}
+        
     def render(self, reduce_res=True, add_memory=True, update_mem=True):
         game_pixels_render = self.screen.screen_ndarray() # (144, 160, 3)
 
@@ -252,8 +266,10 @@ class PokemonRed(Env):
         obs_flat = obs_memory[
             frame_start:frame_start+self.output_shape[0], ...].flatten().astype(np.float32)
 
-        self.update_frame_knn_index(obs_flat)
-        new_reward, new_prog = self.compute_rewards()
+        if self.use_screen_explore:
+            self.update_frame_knn_index(obs_flat)
+        else:
+            self.update_seen_coords()        new_reward, new_prog = self.compute_rewards()
         self.cfg["state_params"]["health"] = self.read_hp_fraction()
 
         # shift over short term reward memory
@@ -272,6 +288,9 @@ class PokemonRed(Env):
     def run_action_on_emulator(self, action):
         # press button then release after some steps
         self.pyboy.send_input(self.valid_actions[action])
+        # disable rendering when we don't need it
+        if not self.save_video and self.headless:
+            self.pyboy._rendering(False)
         for i in range(self.act_freq):
             # release action, so they are stateless
             if i == 8:
@@ -281,10 +300,12 @@ class PokemonRed(Env):
                 if action > 3 and action < 6:
                     # release button 
                     self.pyboy.send_input(self.release_button[action - 4])
-                if action == WindowEvent.PRESS_BUTTON_START:
+                if self.valid_actions[action] == WindowEvent.PRESS_BUTTON_START:
                     self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_START)
             if self.save_video and not self.fast_video:
                 self.add_video_frame()
+            if i == self.act_freq-1:
+                self.pyboy._rendering(True)
             self.pyboy.tick()
         if self.save_video and self.fast_video:
             self.add_video_frame()
@@ -298,12 +319,16 @@ class PokemonRed(Env):
         y_pos = self.read_m(0xD361)
         map_n = self.read_m(0xD35E)
         levels = [self.read_m(a) for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]]
+        if self.use_screen_explore:
+            expl = ('frames', self.knn_index.get_current_count())
+        else:
+            expl = ('coord_count', len(self.seen_coords))
         return {
             'step': self.step_count, 'x': x_pos, 'y': y_pos, 'map': map_n,
             'last_action': action,
             'pcount': self.read_m(0xD163), 'levels': levels, 'ptypes': self.read_party(),
             'hp': self.read_hp_fraction(),
-            'frames': self.knn_index.get_current_count(),
+            expl[0]: expl[1],
             'deaths': self.death_count, 'badge': self.get_badges(),
             'event': self.rewards["event"], 'healr': self.cfg["reward_params"]["total_healing_rew"]
         }
@@ -323,9 +348,21 @@ class PokemonRed(Env):
         else:
             # check for nearest frame and add if current 
             labels, distances = self.knn_index.knn_query(frame_vec, k = 1)
-            if distances[0] > self.similar_frame_dist:
+            if distances[0][0] > self.similar_frame_dist:
                 self.knn_index.add_items(
                     frame_vec, np.array([self.knn_index.get_current_count()]))
+
+    def update_seen_coords(self):
+        x_pos = self.read_m(0xD362)
+        y_pos = self.read_m(0xD361)
+        map_n = self.read_m(0xD35E)
+        coord_string = f"x:{x_pos} y:{y_pos} m:{map_n}"
+        if self.get_levels_sum() >= 22 and not self.levels_satisfied:
+            self.levels_satisfied = True
+            self.base_explore = len(self.seen_coords)
+            self.seen_coords = {}
+
+        self.seen_coords[coord_string] = self.step_count
 
     def compute_rewards(self):
         # addresses from https://datacrystal.romhacking.net/wiki/Pok%C3%A9mon_Red/Blue:RAM_map
